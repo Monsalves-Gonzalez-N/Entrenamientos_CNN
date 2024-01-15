@@ -1,2 +1,0 @@
-# Entrenamientos_CNN
-entrenamientos_CNN
