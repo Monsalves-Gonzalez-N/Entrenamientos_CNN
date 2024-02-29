@@ -36,8 +36,9 @@ from sklearn.model_selection import train_test_split
 from sklearn import preprocessing, metrics
 from sklearn.datasets import make_classification
 from sklearn.utils import class_weight
-from sklearn.metrics import f1_score
+from sklearn.metrics import f1_score, accuracy_score, recall_score,precision_score
 from sklearn.ensemble import RandomForestClassifier
+
 # Importaciones de pandas
 import pandas as pd
 from pandarallel import pandarallel
@@ -46,7 +47,7 @@ pandarallel.initialize(progress_bar=True)
 # Importaciones de matplotlib
 import matplotlib
 import matplotlib.pyplot as plt
-from matplotlib.ticker import FormatStrFormatter
+from matplotlib.ticker import FormatStrFormatter, MaxNLocator
 from IPython.core.pylabtools import figsize, getfigs
 import matplotlib.ticker as ticker
 
@@ -62,6 +63,7 @@ from plotly.subplots import make_subplots
 
 # Importaciones de numpy
 import numpy as np
+from scipy import stats
 
 # Importaciones de astropy
 from astropy.io import fits
@@ -132,6 +134,8 @@ def review_open_data(nomb,path_datos,database):
         try :
             df = pd.read_csv(f"{path}/{nomb}.dat",delim_whitespace=True,names=["jd","mag","err"])
             df_sigma = df.loc[(df["mag"] < np.mean(df["mag"]) + 3*np.std(df["mag"])) & ( df["mag"] > np.mean(df["mag"]) - 3*np.std(df["mag"]) )]
+            if len(df_sigma)>2000:
+                df_sigma = df_sigma.sample(2000,random_state=42).reset_index(drop=True)
             obs_eliminadas = len(df) - len(df_sigma)
             amplitud = df_sigma["mag"].max() - df_sigma["mag"].min()
             mag_mean = df_sigma["mag"].mean()
@@ -140,10 +144,12 @@ def review_open_data(nomb,path_datos,database):
             err_std = df_sigma["err"].std()
             obs_final = len(df_sigma)
             obs_inicial = len(df)
-            baseline = df_sigma["jd"].max() - df_sigma["jd"].min()
-            return 1,nomb,database,obs_eliminadas,amplitud,mag_mean,mag_std,err_mean,err_std,obs_final,obs_inicial, baseline
+            baseline = df["jd"].max() - df["jd"].min()
+            cadence = df.sort_values(by="jd")["jd"].diff().mean()
+            cadence_sigma = df_sigma.sort_values(by="jd")["jd"].diff().mean()
+            return 1,nomb,database,obs_eliminadas,amplitud,mag_mean,mag_std,err_mean,err_std,obs_final,obs_inicial, baseline,cadence,cadence_sigma
         except:
-            return 0,nomb,database,np.nan,np.nan,np.nan,np.nan,np.nan,np.nan,np.nan,np.nan, np.nan
+            return 0,nomb,database,np.nan,np.nan,np.nan,np.nan,np.nan,np.nan,np.nan,np.nan, np.nan, np.nan
 
         
 def ra_dec_to_degrees(ra_str, dec_str):
@@ -302,6 +308,40 @@ def balance_data(input_df, exclude_df):
 
     return input_df,balanced_df
     
+
+def metrics_per_model(tests,name,path):
+    # Load data
+    data = h5py.File(f"{path}/Data.hdf5", 'r+')
+    df_8mil = pd.read_csv(f"{path}/prueba_8mil.csv")
+    idx_test = df_8mil.loc[df_8mil["Train_8"]=="test"].index.values
+    test = df_8mil.loc[df_8mil["Train_8"]=="test"]
+    test = test.drop(columns={"Train_8","aug","g","bins"})
+    
+    # Prepare data generator
+    test_datagen = ImageDataGenerator()
+    test_gen = test_datagen.flow(
+        data[name+"_data"][idx_test],
+        data[name+"_label"][idx_test],
+        batch_size=32
+    )
+    
+    model = make_model()
+    acc = []
+    f1 = []
+    rec = []
+    prec = []
+    for i, prueba in enumerate(tests):
+        model.load_weights(f"{path}/{prueba}/cp.ckpt")
+        prediction(test, test_gen, model, prueba)
+
+        # Calculate F1 Score
+        rec.append(recall_score(test_gen.y, test[f"label_predict_{prueba}"],average="macro"))
+        f1.append(f1_score(test_gen.y, test[f"label_predict_{prueba}"],average="macro"))
+        acc.append(accuracy_score(test_gen.y, test[f"label_predict_{prueba}"]))
+        prec.append(precision_score(test_gen.y, test[f"label_predict_{prueba}"],average="macro"))
+
+    return acc,f1,rec,prec
+    
 def data_augmented_parameter_creator(df):
     rng = np.random.default_rng(42) 
 
@@ -409,7 +449,13 @@ def plot_obs_dist(df, split_name,path):
 
     for i, ax in enumerate(axes.flatten()):
         sns.histplot(ax=ax, data=df, x=columns[i], hue=split_name, bins=30, log_scale=log_scales[i], fill=True, common_norm=True, multiple="stack")
+        ks_test = stats.kstest(df.loc[df["Train_8"]=="train"][columns[i]],df.loc[df["Train_8"]=="test"][columns[i]])
+        ks_test = np.round(ks_test[0],3)
+        ks_val = stats.kstest(df.loc[df["Train_8"]=="train"][columns[i]],df.loc[df["Train_8"]=="val"][columns[i]])
+        ks_val = np.round(ks_val[0],3)
+
         ax.set(xlabel=labels[i], ylabel="")
+        ax.set_title(f' K-S: T={ks_test}, V={ks_val}')
         if x_ticks[i] is not None:
             ax.set_xticks(x_ticks[i])
         if y_scale_log[i]:
@@ -433,6 +479,50 @@ def plot_obs_dist(df, split_name,path):
     fig.tight_layout()
     plt.savefig(f"{path}/Distribution_splits.pdf", bbox_inches="tight")
     plt.show()
+    return 
+  
+
+def make_lc_hist_with_time(nomb,
+                 per_vsx,
+                 path_datos,
+                 database,
+                 aug,
+                 rng,
+                 g,
+                 bins):
+    start_time = time.time()
+
+    # Inicialización de tiempos
+    times = {'task': [],
+             'time': []}
+
+    # Carga de datos
+    t0 = time.time()
+    path = path_datos[database]
+    df = pd.read_csv(f"{path}/{nomb}.dat", delim_whitespace=True, names=["d", "mag", "e"])
+    times['task'].append('load_csv')
+    times['time'].append(time.time() - t0)
+
+    # Limpieza de datos
+    t0 = time.time()
+    df_sigma = df.loc[(df["mag"] < np.mean(df["mag"]) + 3*np.std(df["mag"])) & (df["mag"] > np.mean(df["mag"]) - 3*np.std(df["mag"]))].reset_index(drop=True)
+    df_sigma["fase"] = np.mod(df_sigma.d, per_vsx) / per_vsx
+    if len(df_sigma) > 2000:
+        df_sigma = df_sigma.sample(2000, random_state=42)
+    times['task'].append('Prepare Data')
+    times['time'].append(time.time() - t0)
+    # Proceso dependiendo de la augmentación
+    t0 = time.time()
+    #  make_2d_histogram
+    hdu = make_2d_histogram(32+1, 32+1, df_sigma.mag, df_sigma.fase, norm_max="max")
+    times['task'].append('histogram')
+    times['time'].append(time.time() - t0)
+    total_time = time.time() - start_time
+    times_df = pd.DataFrame(times)
+    times_df['percentage'] = (times_df['time'] / total_time) * 100
+    print(times_df)
+    return hdu.data, times_df
+
     
 
 def plot_histograms(estrellas_plot,path_datos, norm,path):
@@ -547,7 +637,7 @@ def train_models(df_lista, keys_lista, data, prueba_8mil,path,epochs=200, use_ba
     idx_val = prueba_8mil.loc[prueba_8mil['Train_8']=="val"].index.values
     val_label = data['Number_CEP_label'][idx_val]
     val_data = data["Number_CEP_data"][idx_val]
-    val_gen = validation_datagen.flow(val_data, val_label, batch_size=32, shuffle=True)
+    val_gen = validation_datagen.flow(val_data, val_label, batch_size=128, shuffle=True)
 
     for df, test_name in zip(df_lista, keys_lista):
         K.clear_session()
@@ -566,14 +656,14 @@ def train_models(df_lista, keys_lista, data, prueba_8mil,path,epochs=200, use_ba
         else :
             idx_train = df.loc[(df["Train_8"]!="test")&(df["Train_8"]!="val")].index.values
 
-        bz = int((len(idx_train) * 96)/ len(prueba_8mil.loc[prueba_8mil['Train_8']=="train"]))
+        bz = 128 #int((len(idx_train) * 96)/ len(prueba_8mil.loc[prueba_8mil['Train_8']=="train"]))
     
         train_label = data[f'{test_name}_label'][idx_train]
         
         train_data = data[f'{test_name}_data'][idx_train]
         
         if use_balanced_generator:
-            train_gen = BalancedDataGenerator(train_data, train_label, batch_size=96)
+            train_gen = BalancedDataGenerator(train_data, train_label, batch_size=128)
         else:
             train_datagen = ImageDataGenerator()
             train_gen = train_datagen.flow(train_data, train_label, batch_size=bz, shuffle=True)
@@ -593,19 +683,20 @@ def augmented_to(ID,count,df):
 
 def plot_accuracy_and_loss(path,file_names, title_names, amarillo_train, purpura_val, output_file="training_.pdf"):
     plt.rcParams["figure.figsize"] = (18,8)
-    sns.set_context("paper", font_scale=1.5, rc={"lines.linewidth": 1.5})
+    sns.set_context("paper", font_scale=2, rc={"lines.linewidth": 2})
     sns.set_style("whitegrid")
     fig, axs = plt.subplots(2, len(file_names), sharex="col", sharey="row")
     metrics = ["acc", "val_acc", "loss", "val_loss"]
-    labels = ['Training data Augmentation', 'Validation data Augmentation', 'Training data Augmentation', 'Validation data Augmentation']
-    labels_batch = ['Training batch balanced', 'Validation batch balanced', 'Training batch balanced', 'Validation batch balanced']    
+    labels = ['Training D.A.', 'Validation D.A.', 'Training D.A.', 'Validation D.A.']
+    labels_batch = ['Training B.B.', 'Validation B.B.', 'Training B.B.', 'Validation B.B.']    
     colors = [amarillo_train, purpura_val, amarillo_train, purpura_val]
     linestyles = ["-.", ".as", "dashdot", "dashdot"]
 
     for i, file_name in enumerate(file_names):
         batch_name = file_name.split("softmax")[0]+"softmax_batchBalanced"+file_name.split("softmax")[1]
         df = pd.read_csv(f"{path}/{file_name}.csv")
-        df_batch = pd.read_csv(f"{path}/{batch_name}.csv")
+        if file_name != "history_softmax_Number_CEP":
+            df_batch = pd.read_csv(f"{path}/{batch_name}.csv")
 
         for j, metric in enumerate(metrics):
             sns.lineplot(ax=axs[j//2, i], data=df, x="epoch", y=metric, 
@@ -630,8 +721,58 @@ def plot_accuracy_and_loss(path,file_names, title_names, amarillo_train, purpura
     axs[1,0].set_ylabel('Loss')
 
     handles, labels = axs[1,2].get_legend_handles_labels()
-    fig.legend(handles, labels, loc=(0.19,0.5), ncol=4, fancybox=True, shadow=True)
+    fig.legend(handles, labels, loc=(0.1,0.5), ncol=4, fancybox=True, shadow=True)
 
+    plt.tight_layout()
+    plt.subplots_adjust(hspace=0.05)
+    plt.savefig(output_file, bbox_inches="tight")
+    return
+    
+
+def plot_accuracy_and_loss(path,file_names, title_names, amarillo_train, purpura_val, output_file="training_.pdf"):
+    plt.rcParams["figure.figsize"] = (18,9)
+    sns.set_context("paper", font_scale=2.5, rc={"lines.linewidth": 2})
+    sns.set_style("whitegrid")
+    fig, axs = plt.subplots(2, len(file_names), sharex="col", sharey="row")
+    metrics = ["acc", "val_acc", "loss", "val_loss"]
+    labels = ['Training D.A.', 'Validation D.A.', 'Training D.A.', 'Validation D.A.']
+    labels_batch = ['Training B.B.', 'Validation B.B.', 'Training B.B.', 'Validation B.B.']    
+    colors = [amarillo_train, purpura_val, amarillo_train, purpura_val]
+    linestyles = ["-.", ".as", "dashdot", "dashdot"]
+
+    for i, file_name in enumerate(file_names):
+        batch_name = file_name.split("softmax")[0]+"softmax_batchBalanced"+file_name.split("softmax")[1]
+        df = pd.read_csv(f"{path}/{file_name}.csv")
+        if file_name != "history_softmax_Number_CEP":
+            df_batch = pd.read_csv(f"{path}/{batch_name}.csv")
+
+        for j, metric in enumerate(metrics):
+            sns.lineplot(ax=axs[j//2, i], data=df, x="epoch", y=metric, 
+                         color=colors[j], label=labels[j], linestyle="solid")
+            if i > 0:
+                sns.lineplot(ax=axs[j//2, i], data=df_batch, x="epoch", y=metric, 
+                             color=colors[j], label=labels_batch[j], linestyle="dashed")
+
+        axs[0,i].set_title(title_names[i])
+        axs[0,i].set_ylim([0.6,1])
+        axs[1,i].set_ylim([0.6,1])
+        axs[0,i].set_yticks(np.linspace(0.6,1,8))
+        axs[1,i].set_yticks(np.linspace(0,0.9,8))
+        axs[0,i].yaxis.set_major_formatter(FormatStrFormatter('%.2f'))
+        axs[1,i].yaxis.set_major_formatter(FormatStrFormatter('%.2f'))
+        axs[1,i].set_xlabel('')
+        axs[1, i].xaxis.set_major_locator(MaxNLocator(4, integer=True, min_n_ticks=4))
+        axs[0, i].xaxis.set_major_locator(MaxNLocator(4, integer=True, min_n_ticks=4))
+
+        axs[0,i].get_legend().remove()
+        axs[1,i].get_legend().remove()
+
+    axs[0,0].set_ylabel('Accuracy',fontsize=25)
+    axs[1,0].set_ylabel('Loss',fontsize=25)
+
+    handles, labels = axs[1,2].get_legend_handles_labels()
+    fig.legend(handles, labels, loc=(0.15,0.5), ncol=4, fancybox=True, shadow=True)
+    fig.text(0.5, 0.01, 'Epoch', ha='center', va='center', fontsize=25)
     plt.tight_layout()
     plt.subplots_adjust(hspace=0.05)
     plt.savefig(output_file, bbox_inches="tight")
@@ -700,7 +841,7 @@ def run_analysis(tests,titles,name,path):
     
     
 def undersampling_CM(prueba,titles,name,path):
-    # Load data
+    sns.set_context("paper", font_scale=2.5, rc={"lines.linewidth": 2})
     data = h5py.File(f"{path}/Data.hdf5", 'r+')
     df_8mil = pd.read_csv(f"{path}/prueba_8mil.csv")
     idx_test = df_8mil.loc[df_8mil["Train_8"]=="test"].index.values
@@ -712,7 +853,7 @@ def undersampling_CM(prueba,titles,name,path):
     test_gen = test_datagen.flow(
         data[name+"_data"][idx_test],
         data[name+"_label"][idx_test],
-        batch_size=32
+        batch_size=64
     )
     
     model = make_model()
@@ -721,7 +862,7 @@ def undersampling_CM(prueba,titles,name,path):
     
     prediction(test, test_gen, model, prueba)
     
-    fig, ax = plt.subplots(1, 1, figsize=(10, 10))
+    fig, ax = plt.subplots(1, 1, figsize=(7.5, 7.5))
 
 
         # Calculate F1 Score
@@ -816,10 +957,10 @@ def metricas(labels,predict):
     report = metrics.classification_report(labels,predict, output_dict=True, digits=2)
     return report
 
-def train_random_forest(X_train, y_train, X_test, y_test, n_estimators=500, random_state=42):
+def train_random_forest(X_train, y_train, X_test, y_test,path, n_estimators):
+    sns.set_context("paper", font_scale=2.5, rc={"lines.linewidth": 2})
     # Crea el clasificador Random Forest
-    clf = RandomForestClassifier(n_estimators=n_estimators, random_state=random_state)
-    
+    clf = RandomForestClassifier(n_estimators=n_estimators, random_state=42)    
     # Entrena el clasificador
     clf.fit(X_train, y_train)
     
@@ -827,29 +968,27 @@ def train_random_forest(X_train, y_train, X_test, y_test, n_estimators=500, rand
     y_pred = clf.predict(X_test)
     
     # Crea una figura y ejes para la trama
-    fig, ax = plt.subplots(figsize=(8, 8))
+    fig, ax = plt.subplots(figsize=(6,6))
 
     array, annot = C_M(y_test, y_pred)
     sns.heatmap(array, annot=annot, fmt='', vmin=0, vmax=np.sum(array, axis=1)[0], cmap="BuPu",
                 annot_kws={"fontsize":15}, linewidth=1, ax=ax, cbar=False)
     
     ax.set_yticks([0.5,1.5,2.5,3.5,4.5,5.5,6.5])
-    ax.set_yticklabels(['ELL', 'Mira', 'Cep', 'Dsct', 'Ecl', 'Lpv', 'RRlyr'], fontsize=20)
+    ax.set_yticklabels(['ELL', 'M', 'CEP', 'DST', 'E', 'LPV', 'RR'], fontsize=15)
     ax.set_ylabel('True Label', fontsize=20)
     
     ax.set_xticks([0.5,1.5,2.5,3.5,4.5,5.5,6.5])
-    ax.set_xticklabels(['ELL', 'Mira', 'Cep', 'Dsct', 'Ecl', 'Lpv', 'RRlyr'], fontsize=20)
+    ax.set_xticklabels(['ELL', 'M', 'CEP', 'DST', 'E', 'LPV', 'RR'], fontsize=15)
     ax.set_xlabel('Predicted Label', fontsize=20)
     
     # Add title and F1 Score
     # Calculate F1 Score
     f1 = f1_score(y_test, y_pred, average='weighted')
-    ax.set_title(f'Random Forest\nF1 Score: {f1:.2f}', fontsize=20)
+    ax.set_title(f'CNN+RF\nF1 Score: {f1:.2f}', fontsize=20)
 
     fig.tight_layout(pad=0)
-    plt.savefig("CNN_And_RF.pdf", bbox_inches="tight")
-
-    return clf, y_pred
-
+    plt.savefig(f"{path}CNN_And_RF.pdf", bbox_inches="tight")
+    return y_pred
     
 
