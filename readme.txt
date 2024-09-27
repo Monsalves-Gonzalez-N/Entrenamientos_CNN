@@ -10,3 +10,8 @@ Now, you must create a conda environment with the necessary packages. Inside the
  
  
 And that's it!
+
+
+We are awaiting the publication in the journal before finalizing the upload of information to Zenodo. Until then, the catalogs and data are available on Google Drive
+
+https://drive.google.com/drive/folders/10P26YlFo1axLGPlLsf1lN4G1QO0WEHVc?usp=sharing
